@@ -287,6 +287,7 @@ settings = {
     'seed': -1,
     'custom_stopping_strings': '',
     'custom_token_bans': '',
+    'banned_strings': '',
     'negative_prompt': '',
     'dark_theme': True,
     'show_two_notebook_columns': False,

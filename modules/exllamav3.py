@@ -1,5 +1,7 @@
+import json
 import math
 import queue
+import random
 import threading
 from pathlib import Path
 from typing import Any, List, Tuple
@@ -14,7 +16,9 @@ from exllamav3.generator.sampler import (
     CustomSampler,
     SS_AdaptiveP,
     SS_Argmax,
+    SS_Base,
     SS_MinP,
+    SS_NoOp,
     SS_PresFreqP,
     SS_RepP,
     SS_Sample,
@@ -22,7 +26,9 @@ from exllamav3.generator.sampler import (
     SS_TopK,
     SS_TopP
 )
+from exllamav3.generator.sampler.custom import SS
 from modules import shared
+from modules.rhetoric_suppressor import RhetoricSuppressionFilter
 from modules.image_utils import (
     convert_image_attachments_to_pil,
     convert_openai_messages_to_images
@@ -57,6 +63,210 @@ class LogitBiasFilter(Filter):
                 if 0 <= token_id < self.vocab_size:
                     self._mask[0, token_id] = bias
         return self._mask
+
+
+class BannedStringsFilter(Filter):
+    """Filter that prevents tokens containing banned substrings from being sampled.
+    Handles both single-token strings (via vocabulary substring scan) and multi-token
+    strings (via dynamic sequence tracking).
+    """
+
+    def __init__(self, tokenizer, banned_strings):
+        super().__init__(tokenizer=tokenizer, trigger_token=None, prefix_str=None, eos_after_completed=False)
+        self.banned_strings = [s.strip() for s in banned_strings if s.strip()]
+        self._static_mask = None
+        self._sequences = []
+        self._active = []
+        self._positions = []
+
+        for bs in self.banned_strings:
+            encoded = tokenizer.encode(bs)
+            token_ids = encoded[0].tolist() if encoded.dim() > 1 else encoded.tolist()
+            if len(token_ids) > 1:
+                self._sequences.append(token_ids)
+
+        self._active = [False] * len(self._sequences)
+        self._positions = [0] * len(self._sequences)
+
+    def reset(self):
+        self._active = [False] * len(self._sequences)
+        self._positions = [0] * len(self._sequences)
+
+    def accept_token(self, token):
+        new_active = []
+        new_positions = []
+        for i, seq in enumerate(self._sequences):
+            if self._active[i] and self._positions[i] + 1 < len(seq) and seq[self._positions[i] + 1] == token:
+                new_active.append(True)
+                new_positions.append(self._positions[i] + 1)
+            elif seq[0] == token:
+                new_active.append(True)
+                new_positions.append(0)
+            else:
+                new_active.append(False)
+                new_positions.append(0)
+        self._active = new_active
+        self._positions = new_positions
+
+    def is_completed(self):
+        return False
+
+    def use_background_worker(self):
+        return False
+
+    def get_next_logit_mask(self):
+        if self._static_mask is None:
+            self._build_static_mask()
+
+        has_active = any(self._active)
+        if not has_active:
+            return self._static_mask
+
+        result = self._static_mask.clone()
+        for i in range(len(self._sequences)):
+            if self._active[i] and self._positions[i] + 1 < len(self._sequences[i]):
+                token = self._sequences[i][self._positions[i] + 1]
+                if 0 <= token < result.shape[-1]:
+                    result[0, token] = float('-inf')
+        return result
+
+    def _build_static_mask(self):
+        logger.info(f"Building BannedStringsFilter mask over {self.vocab_size} tokens...")
+        self._static_mask = torch.zeros((1, self.vocab_size), dtype=self.logits_dtype)
+        id_to_piece = self.tokenizer.get_id_to_piece_list(True)
+        banned_lower = [s.lower() for s in self.banned_strings]
+        banned_count = 0
+        for tid, piece in enumerate(id_to_piece):
+            if tid >= self.vocab_size:
+                break
+            lower_piece = piece.replace('\u2581', ' ').lower()
+            for bs in banned_lower:
+                if bs in lower_piece or bs in piece.lower():
+                    self._static_mask[0, tid] = float('-inf')
+                    banned_count += 1
+                    break
+        logger.info(f"BannedStringsFilter: {banned_count} tokens banned for {self.banned_strings}")
+
+
+class SS_DRY(SS_Base):
+    """DRY (Don't Repeat Yourself) repetition penalty sampler."""
+
+    def __init__(self, multiplier, base, allowed_length, sequence_breakers, _range):
+        self.multiplier = multiplier
+        self.base = base
+        self.allowed_length = allowed_length
+        self.sequence_breakers = sequence_breakers
+        self._range = _range
+
+    def run(self, state):
+        match state.state:
+            case SS.INIT:
+                state.logits = state.in_logits.float()
+                state.state = SS.LOGITS
+            case SS.LOGITS:
+                pass
+            case _:
+                return
+
+        past_ids = state.past_ids
+        if past_ids is None or past_ids.shape[-1] < 2:
+            return
+
+        tokens = past_ids[0].tolist()
+        if self._range > 0:
+            tokens = tokens[-self._range:]
+
+        last_token = tokens[-1]
+        if last_token in self.sequence_breakers:
+            return
+
+        match_lengths = {}
+        n = len(tokens)
+        for i in range(n - 1):
+            if tokens[i] == last_token:
+                next_token = tokens[i + 1]
+                if next_token in self.sequence_breakers:
+                    continue
+
+                match_length = 1
+                while match_length < 50:
+                    j = i - match_length
+                    if j < 0:
+                        break
+                    if tokens[-(match_length + 1)] != tokens[j]:
+                        break
+                    if tokens[j] in self.sequence_breakers:
+                        break
+                    match_length += 1
+
+                if next_token in match_lengths:
+                    match_lengths[next_token] = max(match_length, match_lengths[next_token])
+                else:
+                    match_lengths[next_token] = match_length
+
+        dim = state.logits.shape[-1]
+        indices = []
+        penalties = []
+        for token, match_length in match_lengths.items():
+            if match_length >= self.allowed_length and 0 <= token < dim:
+                penalty = self.multiplier * self.base ** (match_length - self.allowed_length)
+                indices.append(token)
+                penalties.append(penalty)
+
+        if indices:
+            device = state.logits.device
+            idx_tensor = torch.tensor(indices, device=device, dtype=torch.long)
+            penalty_tensor = torch.tensor(penalties, device=device, dtype=torch.float)
+            state.logits[0, idx_tensor] -= penalty_tensor
+
+    def reqs_past_ids(self):
+        return True
+
+
+class SS_XTC(SS_Base):
+    """Exclude Top Choices sampler. Removes all but one token above a probability threshold."""
+
+    def __init__(self, threshold, probability, special_token_ids):
+        self.threshold = threshold
+        self.probability = probability
+        self.special_token_ids = special_token_ids
+
+    def run(self, state):
+        if random.random() >= self.probability:
+            return
+
+        match state.state:
+            case SS.INIT:
+                logits = state.in_logits.float()
+            case SS.LOGITS:
+                logits = state.logits
+            case _:
+                return
+
+        sorted_logits, sorted_indices = torch.sort(logits, dim=-1, descending=True)
+        probs = torch.softmax(sorted_logits, dim=-1)
+
+        sorted_to_remove = torch.full_like(probs, False, dtype=torch.bool)
+        sorted_to_remove[..., :-1] = probs[..., 1:] >= self.threshold
+        to_remove = sorted_to_remove.scatter(1, sorted_indices, sorted_to_remove)
+
+        if self.special_token_ids:
+            special_tensor = torch.tensor(
+                self.special_token_ids, device=to_remove.device, dtype=torch.long
+            )
+            if to_remove[:, special_tensor].any():
+                return
+
+        match state.state:
+            case SS.INIT:
+                state.logits = logits
+                state.state = SS.LOGITS
+        state.logits.masked_fill_(to_remove, float('-inf'))
+
+    def alt(self):
+        if self.probability <= 0:
+            return SS_NoOp()
+        return None
 
 
 class ConcurrentGenerator:
@@ -332,6 +542,38 @@ class Exllamav3Model:
             if state['presence_penalty'] != 0.0 or state['frequency_penalty'] != 0.0:
                 unordered_samplers.append(SS_PresFreqP(state['presence_penalty'], state['frequency_penalty'], penalty_range, rep_decay))
 
+            if state.get('dry_multiplier', 0) > 0:
+                dry_sequence_breakers = state.get('dry_sequence_breakers', '"\\n", ":", "\\"", "*"')
+                if not dry_sequence_breakers.startswith("["):
+                    dry_sequence_breakers = "[" + dry_sequence_breakers + "]"
+                sequence_breaker_strings = json.loads(dry_sequence_breakers)
+                sequence_breakers = set()
+                for s in sequence_breaker_strings:
+                    encoded = self.tokenizer.encode('a' + s)
+                    if encoded.shape[-1] > 0:
+                        sequence_breakers.add(encoded[0, -1].item())
+                unordered_samplers.append(SS_DRY(
+                    multiplier=state['dry_multiplier'],
+                    base=state['dry_base'],
+                    allowed_length=state['dry_allowed_length'],
+                    sequence_breakers=sequence_breakers,
+                    _range=state['repetition_penalty_range'],
+                ))
+
+            if state.get('xtc_probability', 0) > 0:
+                xtc_special = []
+                newline_encoded = self.tokenizer.encode("\n")
+                if newline_encoded.shape[-1] > 0:
+                    xtc_special.append(newline_encoded[0, -1].item())
+                for eid in self.config.eos_token_id_list:
+                    if eid is not None:
+                        xtc_special.append(eid)
+                unordered_samplers.append(SS_XTC(
+                    threshold=state.get('xtc_threshold', 0.1),
+                    probability=state['xtc_probability'],
+                    special_token_ids=xtc_special,
+                ))
+
             if state['top_k'] > 0:
                 unordered_samplers.append(SS_TopK(state['top_k']))
             if state['top_p'] < 1.0:
@@ -345,13 +587,15 @@ class Exllamav3Model:
             class_name_to_nickname = {
                 'SS_RepP': 'repetition_penalty',
                 'SS_PresFreqP': 'presence_frequency_penalty',
+                'SS_DRY': 'dry',
+                'SS_XTC': 'xtc',
                 'SS_TopK': 'top_k',
                 'SS_TopP': 'top_p',
                 'SS_MinP': 'min_p',
                 'SS_Temperature': 'temperature',
             }
 
-            default_priority = ['repetition_penalty', 'presence_frequency_penalty', 'top_k', 'top_p', 'min_p', 'temperature']
+            default_priority = ['repetition_penalty', 'presence_frequency_penalty', 'dry', 'xtc', 'top_k', 'top_p', 'min_p', 'temperature']
             sampler_priority = list(state.get('sampler_priority') or default_priority)
 
             if state['temperature_last'] and 'temperature' in sampler_priority:
@@ -409,6 +653,23 @@ class Exllamav3Model:
             eos_bias = {str(eid): float('-inf') for eid in eos_ids}
             filters.append(LogitBiasFilter(self.tokenizer, eos_bias))
 
+        if state.get('custom_token_bans'):
+            to_ban = [int(x.strip()) for x in state['custom_token_bans'].split(',') if x.strip()]
+            if to_ban:
+                ban_bias = {str(tid): float('-inf') for tid in to_ban}
+                filters.append(LogitBiasFilter(self.tokenizer, ban_bias))
+
+        if state.get('banned_strings'):
+            raw = state['banned_strings']
+            if isinstance(raw, list):
+                banned_strings_list = [s.strip() for s in raw if s.strip()]
+            elif isinstance(raw, str):
+                banned_strings_list = [s.strip() for s in raw.split('\n') if s.strip()]
+            if banned_strings_list:
+                filters.append(BannedStringsFilter(self.tokenizer, banned_strings_list))
+
+        filters.append(RhetoricSuppressionFilter(self.tokenizer))
+
         return_top_tokens = max(state.get('logprobs') or 0, 0)
 
         seed = state.get('seed', -1)
@@ -420,7 +681,7 @@ class Exllamav3Model:
             sampler=sampler,
             seed=seed if seed >= 0 else None,
             stop_conditions=stop_conditions if stop_conditions else None,
-            filters=filters if filters else None,
+            filters=filters,
             return_top_tokens=return_top_tokens,
             return_probs=return_top_tokens > 0,
         )

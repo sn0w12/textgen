@@ -190,6 +190,7 @@ def list_interface_input_elements():
         'sampler_priority',
         'custom_stopping_strings',
         'custom_token_bans',
+        'banned_strings',
         'negative_prompt',
         'dry_sequence_breakers',
         'grammar_string',
@@ -330,6 +331,7 @@ def save_settings(state, preset, extensions_list, show_controls, theme_state, ma
     output['seed'] = int(output['seed'])
     output['custom_stopping_strings'] = output.get('custom_stopping_strings') or ''
     output['custom_token_bans'] = output.get('custom_token_bans') or ''
+    output['banned_strings'] = output.get('banned_strings') or ''
     output['show_controls'] = show_controls
     output['dark_theme'] = theme_state == 'dark'
     output.pop('instruction_template_str')
@@ -499,6 +501,7 @@ def setup_auto_save():
         'sampler_priority',
         'custom_stopping_strings',
         'custom_token_bans',
+        'banned_strings',
         'negative_prompt',
         'dry_sequence_breakers',
         'grammar_string',
